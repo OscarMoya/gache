@@ -2,6 +2,8 @@
 package ring
 
 import (
+	"encoding/binary"
+	"encoding/gob"
 	"errors"
 )
 
@@ -19,7 +21,8 @@ type RingBuffer struct {
 	buffer []byte
 	size   int // size of the buffer
 
-	currPosition int // current offset of the (FIFO)
+	currPosition  int // current offset of the (FIFO)
+	tempoPosition int // temporary offset of the (FIFO) used for setting the reader
 
 	// To make things easier, the interaction with the buffer will be via blocks.
 	// This will help identifying where all the blocks of data are stored for an easy retrieval
@@ -38,36 +41,83 @@ func NewRingBuffer(size int) *RingBuffer {
 	}
 }
 
-// Add adds a block of data to the ring buffer. If there is not enough space in the buffer,
-// it will overwrite the oldest data by starting from the beginning of the buffer.
-// This receiver returns error if the block is too big to fit in the buffer
-func (r *RingBuffer) Add(block *Block) error {
+func (r *RingBuffer) write(data []byte) (int, error) {
 
 	// Calculate the length of the block
-	blockLen := block.Len()
+	dataLen := len(data) + BlockHeaderLenSize
 
 	// Check if the block fits in the buffer
-	if blockLen > r.size {
-		return InsufficientBufferSpace
+	if dataLen > r.size {
+		return 0, InsufficientBufferSpace
 	}
 
 	// check if the block fits in the remaining space of the buffer
-	targetPos := r.currPosition + blockLen%r.size
+	targetPos := (r.currPosition + dataLen) % r.size
 	if targetPos < r.currPosition {
 		// If the target position is less than the current position, it means that the block
 		// will wrap around the buffer. the block will need to be written in two parts
 		// First part will be from the current position to the end of the buffer
-		copy(r.buffer[r.currPosition:], block.AllData[:r.size-r.currPosition])
+		copy(r.buffer[r.currPosition:], data[:r.size-r.currPosition])
 		// Second part will be from the beginning of the buffer to the remaining space
-		copy(r.buffer[0:], block.AllData[r.size-r.currPosition:])
+		copy(r.buffer[0:], data[r.size-r.currPosition:])
 	} else {
 		// If the target position is greater than the current position, it means that the block
 		// will not wrap around the buffer. We can write the block in a single part
-		copy(r.buffer[r.currPosition:], block.AllData)
+		copy(r.buffer[r.currPosition:], data)
 	}
 
 	// Update the current position
 	r.currPosition = targetPos
+	return dataLen, nil
+
+}
+
+// Write writes a block of data to the ring buffer. If there is not enough space in the buffer,
+func (r *RingBuffer) Write(b []byte) (int, error) {
+
+	// before adding the block, we need to add the length of the block in the header
+	// to make it easier to read, as the first 8 bytes of the block will represent the length of the block
+	// and will set the reader where the block starts and ends for proper decoding
+	blockLen := len(b)
+	totalLen := blockLen + BlockHeaderLenSize
+
+	if totalLen > r.size {
+		return 0, InsufficientBufferSpace
+	}
+
+	header := make([]byte, 8)
+	binary.LittleEndian.PutUint64(header, uint64(blockLen))
+	_, err := r.write(header)
+	if err != nil {
+		return 0, err
+	}
+	_, err = r.write(b)
+	if err != nil {
+		return 0, err
+	}
+
+	return totalLen, nil
+
+}
+
+func (r *RingBuffer) Read() ([]byte, error) {
+	// Read the length of the block
+	header := make([]byte, 8)
+	_, err := r.read(header)
+	if err != nil {
+		return nil, err
+	}
+}
+
+// Add adds a block of data to the ring buffer. If there is not enough space in the buffer,
+// it will overwrite the oldest data by starting from the beginning of the buffer.
+// This receiver returns error if the block is too big to fit in the buffer
+func (r *RingBuffer) Add(block *Block) error {
+	enc := gob.NewEncoder(r)
+	err := enc.Encode(block)
+	if err != nil {
+		return err
+	}
 	return nil
 
 }
@@ -97,17 +147,8 @@ func (r *RingBuffer) Get(index int, dataSize int, b *Block) error {
 // Intermediate struct to represent the block of data to be stored in the in the ring buffer
 // to make things easier to manage from the upper layers and to keep the buffer as a simple byte array
 type Block struct {
-	hashedKeyLen int    // length of the hashed key
-	rawKeyLen    int    // length of the raw key
-	dataLen      int    // length of the data
-	AllData      []byte // All data packed together in a single byte array. The lens are used to serialize and deserialize the data
-	CreatedAt    int64  // timestamp of the data add request in UnixMilli
-
-}
-
-// Len returns the length of the block. The CrateAt field is not included in the length as there
-// is no real need to include it other than add it in the index
-func (b *Block) Len() int {
-	return b.hashedKeyLen + b.rawKeyLen + b.dataLen
-
+	Timestamp int64
+	HashedKey int64
+	RayKey    []byte
+	Data      []byte
 }
